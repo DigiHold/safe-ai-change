@@ -13,7 +13,7 @@ defined( 'ABSPATH' ) || exit;
 final class Safe_AI_Change {
 
 	const MODEL           = 'claude-haiku-5-5';
-	const API_URL         = 'https://api.anthropic.com/v1/messages';
+	const API_URL         = 'https://api.anthropic.com/v1/messages'; // phpcs:ignore PluginCheck.CodeAnalysis.AIProvider.DirectIntegration -- The spec requires a direct call to claude-haiku-5-5 with two strict tools.
 	const MAX_REQUEST     = 500;
 	const MAX_TEXT        = 400;
 	const TTL             = 600;
