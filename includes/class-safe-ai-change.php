@@ -243,7 +243,8 @@ final class Safe_AI_Change {
 			return $this->refusal( sprintf( __( 'The new text is longer than %d characters.', 'safe-ai-change' ), self::MAX_TEXT ) );
 		}
 
-		$ids = $this->find_products( $identifier );
+		$candidates = $this->find_candidates( $identifier );
+		$ids        = $this->exact_matches( $identifier, $candidates );
 		if ( 0 === count( $ids ) ) {
 			return $this->refusal( __( 'No published product has this exact name or SKU.', 'safe-ai-change' ) );
 		}
@@ -253,7 +254,7 @@ final class Safe_AI_Change {
 		}
 
 		$product_id = $ids[0];
-		$longer     = $this->find_longer_match( $identifier, $product_id, $rest );
+		$longer     = $this->find_longer_match( $identifier, $product_id, $rest, $candidates );
 		if ( '' !== $longer ) {
 			/* translators: %s: product name or SKU. */
 			return $this->refusal( sprintf( __( 'The request also names "%s", a longer product name or SKU, so the request is ambiguous.', 'safe-ai-change' ), $longer ) );
@@ -302,14 +303,12 @@ final class Safe_AI_Change {
 
 	/**
 	 * Runs at shutdown after a change was saved. When the request stopped before a verdict (fatal error, exit),
-	 * it writes the snapshot text back without hooks and records FAILED, since nothing could be checked.
+	 * it saves the snapshot text back with the product object and records FAILED, since nothing could be checked.
 	 *
 	 * @param int $product_id Product ID.
 	 * @param int $user_id    Manager who clicked Apply.
 	 */
 	public function shutdown_guard( $product_id, $user_id ) {
-		global $wpdb;
-
 		if ( $this->settled ) {
 			return;
 		}
@@ -320,23 +319,43 @@ final class Safe_AI_Change {
 		// Runs once, even when both the filter and the shutdown function fire.
 		$this->settled = true;
 
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Emergency restore without hooks, caches cleared right after.
-		$wpdb->update( $wpdb->posts, array( 'post_excerpt' => (string) $snapshot['post']['post_excerpt'] ), array( 'ID' => $product_id ), array( '%s' ), array( '%d' ) );
-		clean_post_cache( $product_id );
 		$last_error = error_get_last();
 		$this->log(
 			'critical',
-			'Apply stopped before a verdict. The snapshot text was written back directly.',
+			'Apply stopped before a verdict. Saving the snapshot text back.',
 			array(
 				'product_id' => $product_id,
 				'php_error'  => is_array( $last_error ) ? $last_error['message'] : '',
 			)
 		);
+		// Stored first, so the manager sees FAILED even if the restore below stops the request too.
+		$this->store_guard_result( $user_id, __( 'The request stopped before the checks finished. Restoring the previous text was attempted. Check the product and the WooCommerce logs now.', 'safe-ai-change' ) );
+
+		// A memory fatal leaves almost no room for a product save.
+		wp_raise_memory_limit( 'admin' );
+		$old_text = (string) $snapshot['data']['short_description'];
+		$error    = $this->save_short_description( $product_id, $old_text );
+		$product  = '' === $error ? $this->fresh_product( $product_id ) : null;
+		if ( $product && (string) $product->get_short_description( 'edit' ) === $old_text ) {
+			$this->log( 'warning', 'Snapshot text saved back after the stop.', array( 'product_id' => $product_id ) );
+			$this->store_guard_result( $user_id, __( 'The request stopped before the checks finished. The previous text was saved back, but nothing could be checked. Check the product and the WooCommerce logs now.', 'safe-ai-change' ) );
+		} else {
+			$this->log( 'critical', 'Saving the snapshot text back failed after the stop.', array( 'product_id' => $product_id ) );
+		}
+	}
+
+	/**
+	 * Stores the FAILED result written by the shutdown guard.
+	 *
+	 * @param int    $user_id Manager who clicked Apply.
+	 * @param string $reason  Explanation shown to the manager.
+	 */
+	private function store_guard_result( $user_id, $reason ) {
 		set_transient(
 			'sac_result_' . $user_id,
 			array(
 				'verdict' => 'FAILED',
-				'reason'  => __( 'The request stopped before the checks finished. The previous text was written back directly, but nothing could be checked. Check the product and the WooCommerce logs now.', 'safe-ai-change' ),
+				'reason'  => $reason,
 				'checks'  => array(),
 			),
 			self::TTL
@@ -666,105 +685,97 @@ final class Safe_AI_Change {
 	}
 
 	/**
-	 * Returns the IDs of published products whose exact name or exact SKU equals the identifier.
-	 *
-	 * @param string $identifier Name or SKU.
-	 * @return int[]
-	 */
-	private function find_products( $identifier ) {
-		global $wpdb;
-
-		// Titles can be stored raw, with kses entities (&amp; only) or fully escaped, so every form is fetched, then compared exactly.
-		$forms = $this->title_forms( $identifier );
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Exact match on fresh data.
-		$rows = $wpdb->get_results(
-			$wpdb->prepare(
-				"SELECT ID, post_title FROM {$wpdb->posts} WHERE post_type = 'product' AND post_status = 'publish' AND post_title IN ( %s, %s, %s )",
-				$forms[0],
-				$forms[1],
-				$forms[2]
-			)
-		);
-		$ids  = array();
-		foreach ( $rows as $row ) {
-			if ( html_entity_decode( $row->post_title, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) === $identifier ) {
-				$ids[] = (int) $row->ID;
-			}
-		}
-
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Exact match on fresh data.
-		$by_sku = $wpdb->get_col(
-			$wpdb->prepare(
-				"SELECT p.ID FROM {$wpdb->posts} p INNER JOIN {$wpdb->postmeta} m ON m.post_id = p.ID WHERE p.post_type = 'product' AND p.post_status = 'publish' AND m.meta_key = '_sku' AND BINARY m.meta_value = %s",
-				$identifier
-			)
-		);
-
-		return array_values( array_unique( array_merge( $ids, array_map( 'intval', $by_sku ) ) ) );
-	}
-
-	/**
-	 * Returns the forms a title can take in the database: raw, with kses entities, and fully escaped.
-	 *
-	 * @param string $identifier Name.
-	 * @return string[] Three forms.
-	 */
-	private function title_forms( $identifier ) {
-		return array( $identifier, wp_kses_normalize_entities( $identifier ), esc_html( $identifier ) );
-	}
-
-	/**
-	 * Returns another published product or variation name or SKU that contains the identifier, is longer, and is written in the request.
+	 * Loads the published products and variations whose name or SKU may contain the identifier.
+	 * WooCommerce matches loosely (SKU with LIKE, names with a word search, any case), so the exact rules run on these objects.
 	 *
 	 * @param string $identifier Name or SKU returned by the AI.
-	 * @param int    $product_id Matched product.
-	 * @param string $request    Request without the new text.
+	 * @return WC_Product[] Keyed by ID.
+	 */
+	private function find_candidates( $identifier ) {
+		$query      = array(
+			'status' => 'publish',
+			'type'   => array_merge( array_keys( wc_get_product_types() ), array( 'variation' ) ),
+			'limit'  => -1,
+		);
+		$candidates = array();
+		foreach ( wc_get_products( array_merge( $query, array( 'sku' => $identifier ) ) ) as $product ) {
+			$candidates[ $product->get_id() ] = $product;
+		}
+
+		// A leading hyphen would turn a search word into an exclusion. Names saved without unfiltered_html store & as &amp;.
+		add_filter( 'wp_query_search_exclusion_prefix', '__return_false' );
+		foreach ( array_unique( array( $identifier, wp_kses_normalize_entities( $identifier ) ) ) as $search ) {
+			foreach ( wc_get_products( array_merge( $query, array( 's' => $search ) ) ) as $product ) {
+				$candidates[ $product->get_id() ] = $product;
+			}
+		}
+		remove_filter( 'wp_query_search_exclusion_prefix', '__return_false' );
+
+		return $candidates;
+	}
+
+	/**
+	 * Returns the IDs of the published products, not variations, whose exact name or exact SKU equals the identifier.
+	 *
+	 * @param string       $identifier Name or SKU returned by the AI.
+	 * @param WC_Product[] $candidates Products from find_candidates().
+	 * @return int[]
+	 */
+	private function exact_matches( $identifier, array $candidates ) {
+		$ids = array();
+		foreach ( $candidates as $id => $product ) {
+			if ( $product->is_type( 'variation' ) ) {
+				continue;
+			}
+			if ( $this->product_name( $product ) === $identifier || (string) $product->get_sku( 'edit' ) === $identifier ) {
+				$ids[] = (int) $id;
+			}
+		}
+		return $ids;
+	}
+
+	/**
+	 * Returns another product or variation name or SKU that contains the identifier, is longer, and is written in the request.
+	 *
+	 * @param string       $identifier Name or SKU returned by the AI.
+	 * @param int          $product_id Matched product.
+	 * @param string       $request    Request without the new text.
+	 * @param WC_Product[] $candidates Products from find_candidates().
 	 * @return string Empty when there is none.
 	 */
-	private function find_longer_match( $identifier, $product_id, $request ) {
-		global $wpdb;
-
-		$forms = $this->title_forms( $identifier );
-		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Fresh data.
-		$titles = $wpdb->get_col(
-			$wpdb->prepare(
-				"SELECT post_title FROM {$wpdb->posts} WHERE post_type IN ( 'product', 'product_variation' ) AND post_status = 'publish' AND ID <> %d AND ( post_title LIKE %s OR post_title LIKE %s OR post_title LIKE %s )",
-				$product_id,
-				'%' . $wpdb->esc_like( $forms[0] ) . '%',
-				'%' . $wpdb->esc_like( $forms[1] ) . '%',
-				'%' . $wpdb->esc_like( $forms[2] ) . '%'
-			)
-		);
-		$skus   = $wpdb->get_col(
-			$wpdb->prepare(
-				"SELECT m.meta_value FROM {$wpdb->posts} p INNER JOIN {$wpdb->postmeta} m ON m.post_id = p.ID WHERE p.post_type IN ( 'product', 'product_variation' ) AND p.post_status = 'publish' AND p.ID <> %d AND m.meta_key = '_sku' AND m.meta_value LIKE %s",
-				$product_id,
-				'%' . $wpdb->esc_like( $identifier ) . '%'
-			)
-		);
-		// phpcs:enable
-
-		$candidates = array();
-		foreach ( $titles as $title ) {
-			$candidates[] = html_entity_decode( $title, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
-		}
-		foreach ( array_merge( $candidates, $skus ) as $candidate ) {
-			$candidate = (string) $candidate;
-			if ( mb_strlen( $candidate ) > mb_strlen( $identifier ) && false !== strpos( $candidate, $identifier ) && false !== strpos( $request, $candidate ) ) {
-				return $candidate;
+	private function find_longer_match( $identifier, $product_id, $request, array $candidates ) {
+		foreach ( $candidates as $id => $product ) {
+			if ( (int) $id === (int) $product_id ) {
+				continue;
+			}
+			foreach ( array( $this->product_name( $product ), (string) $product->get_sku( 'edit' ) ) as $candidate ) {
+				if ( mb_strlen( $candidate ) > mb_strlen( $identifier ) && false !== strpos( $candidate, $identifier ) && false !== strpos( $request, $candidate ) ) {
+					return $candidate;
+				}
 			}
 		}
 		return '';
 	}
 
 	/**
-	 * Loads a product after clearing its caches.
+	 * Returns the product name as the manager reads it, with stored HTML entities decoded.
+	 *
+	 * @param WC_Product $product Product.
+	 * @return string
+	 */
+	private function product_name( WC_Product $product ) {
+		return html_entity_decode( (string) $product->get_name( 'edit' ), ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+	}
+
+	/**
+	 * Loads a product after clearing the WordPress and WooCommerce caches for it.
 	 *
 	 * @param int $product_id Product ID.
 	 * @return WC_Product|null
 	 */
 	private function fresh_product( $product_id ) {
 		clean_post_cache( $product_id );
+		WC_Cache_Helper::invalidate_cache_group( 'object_' . $product_id );
 		$product = wc_get_product( $product_id );
 		return $product instanceof WC_Product ? $product : null;
 	}
@@ -798,7 +809,7 @@ final class Safe_AI_Change {
 
 		// The baseline checks take time, so compare again right before the change.
 		$snapshot = $this->take_snapshot( $product_id );
-		if ( ! isset( $snapshot['post']['post_excerpt'] ) || (string) $snapshot['post']['post_excerpt'] !== $proposal['before'] ) {
+		if ( ! isset( $snapshot['data']['short_description'] ) || (string) $snapshot['data']['short_description'] !== $proposal['before'] ) {
 			$this->log( 'notice', 'The short description changed during the checks before the change.', array( 'product_id' => $product_id ) );
 			return $this->outcome( 'REFUSED', __( 'The short description changed since the preview. Nothing was changed.', 'safe-ai-change' ), $checks );
 		}
@@ -811,7 +822,7 @@ final class Safe_AI_Change {
 			'Snapshot saved.',
 			array(
 				'product_id' => $product_id,
-				'before'     => $snapshot['post']['post_excerpt'],
+				'before'     => $snapshot['data']['short_description'],
 			)
 		);
 
@@ -852,18 +863,6 @@ final class Safe_AI_Change {
 	}
 
 	/**
-	 * Reads the stored short description straight from the database.
-	 *
-	 * @param int $product_id Product ID.
-	 * @return string|null
-	 */
-	private function stored_excerpt( $product_id ) {
-		global $wpdb;
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Must bypass every cache.
-		return $wpdb->get_var( $wpdb->prepare( "SELECT post_excerpt FROM {$wpdb->posts} WHERE ID = %d", $product_id ) );
-	}
-
-	/**
 	 * Restores the snapshot text, proves the product matches the snapshot and runs the checks again.
 	 *
 	 * @param int    $product_id Product ID.
@@ -873,10 +872,8 @@ final class Safe_AI_Change {
 	 * @return array Verdict, reason and checks.
 	 */
 	private function rollback( $product_id, array $snapshot, array $checks, $why ) {
-		global $wpdb;
-
 		$phase    = __( 'Rollback', 'safe-ai-change' );
-		$old_text = (string) $snapshot['post']['post_excerpt'];
+		$old_text = (string) $snapshot['data']['short_description'];
 		$this->log(
 			'warning',
 			'Rolling back.',
@@ -886,23 +883,13 @@ final class Safe_AI_Change {
 			)
 		);
 
-		// A save can report success without writing (wp_update_post errors are not thrown), so read the column back.
-		$error = $this->save_short_description( $product_id, $old_text );
-		if ( '' === $error && $this->stored_excerpt( $product_id ) === $old_text ) {
+		// A save can report success without writing (wp_update_post errors are not thrown), so the product is read back.
+		$error   = $this->save_short_description( $product_id, $old_text );
+		$product = '' === $error ? $this->fresh_product( $product_id ) : null;
+		if ( $product && (string) $product->get_short_description( 'edit' ) === $old_text ) {
 			$checks[] = $this->check( $phase, __( 'Restore with the product object', 'safe-ai-change' ), true, __( 'The snapshot text was saved back.', 'safe-ai-change' ) );
 		} else {
-			$checks[] = $this->check( $phase, __( 'Restore with the product object', 'safe-ai-change' ), false, '' !== $error ? $error : __( 'The save returned, but post_excerpt still differs from the snapshot.', 'safe-ai-change' ) );
-			// The product object failed, so write the column directly, without hooks, then clear the caches.
-			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- Last resort restore, caches cleared right after.
-			$updated = $wpdb->update( $wpdb->posts, array( 'post_excerpt' => $old_text ), array( 'ID' => $product_id ), array( '%s' ), array( '%d' ) );
-			clean_post_cache( $product_id );
-			wc_delete_product_transients( $product_id );
-			$checks[] = $this->check(
-				$phase,
-				__( 'Restore with a direct database update', 'safe-ai-change' ),
-				false !== $updated,
-				false !== $updated ? __( 'The post_excerpt column was written.', 'safe-ai-change' ) : __( 'The database update failed.', 'safe-ai-change' )
-			);
+			$checks[] = $this->check( $phase, __( 'Restore with the product object', 'safe-ai-change' ), false, '' !== $error ? $error : __( 'The save returned, but the short description still differs from the snapshot.', 'safe-ai-change' ) );
 		}
 
 		$proof_phase = __( 'After rollback', 'safe-ai-change' );
@@ -1010,36 +997,39 @@ final class Safe_AI_Change {
 	}
 
 	/**
-	 * Reads the product row, its meta and its terms straight from the database.
+	 * Reads every product property and every custom meta value through a fresh WooCommerce product object.
+	 * Values are serialized, so objects such as attributes and dates compare by content and fit in an option.
 	 *
 	 * @param int $product_id Product ID.
 	 * @return array
 	 */
 	private function take_snapshot( $product_id ) {
-		global $wpdb;
+		$product = $this->fresh_product( $product_id );
+		$data    = array();
+		$meta    = array();
 
-		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- The snapshot must bypass every cache.
-		$post      = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$wpdb->posts} WHERE ID = %d", $product_id ), ARRAY_A );
-		$meta_rows = $wpdb->get_results( $wpdb->prepare( "SELECT meta_key, meta_value FROM {$wpdb->postmeta} WHERE post_id = %d ORDER BY meta_key, meta_id", $product_id ), ARRAY_A );
-		$terms     = $wpdb->get_col( $wpdb->prepare( "SELECT term_taxonomy_id FROM {$wpdb->term_relationships} WHERE object_id = %d ORDER BY term_taxonomy_id", $product_id ) );
-		// phpcs:enable
-
-		$meta = array();
-		foreach ( $meta_rows as $row ) {
-			$meta[ $row['meta_key'] ][] = $row['meta_value'];
+		if ( $product ) {
+			foreach ( $product->get_data() as $key => $value ) {
+				if ( 'meta_data' !== $key ) {
+					$data[ $key ] = maybe_serialize( $value );
+				}
+			}
+			foreach ( $product->get_meta_data() as $meta_item ) {
+				$meta[ $meta_item->key ][] = maybe_serialize( $meta_item->value );
+			}
+			ksort( $meta );
 		}
 
 		return array(
 			'product_id' => $product_id,
 			'taken_at'   => time(),
-			'post'       => is_array( $post ) ? $post : array(),
+			'data'       => $data,
 			'meta'       => $meta,
-			'terms'      => $terms,
 		);
 	}
 
 	/**
-	 * Lists the fields that differ between two snapshots, leaving out the ones WooCommerce or the editor write on their own.
+	 * Lists the product properties and meta keys that differ between two snapshots.
 	 *
 	 * @param array $previous Snapshot before.
 	 * @param array $current  Snapshot now.
@@ -1048,36 +1038,22 @@ final class Safe_AI_Change {
 	private function snapshot_diff( array $previous, array $current ) {
 		$changed = array();
 
-		// WordPress stamps these on every save.
-		$ignored_columns = array( 'post_modified', 'post_modified_gmt' );
-		foreach ( array_unique( array_merge( array_keys( $previous['post'] ), array_keys( $current['post'] ) ) ) as $column ) {
-			if ( in_array( $column, $ignored_columns, true ) ) {
+		foreach ( array_unique( array_merge( array_keys( $previous['data'] ), array_keys( $current['data'] ) ) ) as $key ) {
+			// WooCommerce stamps the modified date on every save.
+			if ( 'date_modified' === $key ) {
 				continue;
 			}
-			if ( ! isset( $previous['post'][ $column ], $current['post'][ $column ] ) || (string) $previous['post'][ $column ] !== (string) $current['post'][ $column ] ) {
-				$changed[] = 'posts.' . $column;
+			if ( ! array_key_exists( $key, $previous['data'] ) || ! array_key_exists( $key, $current['data'] ) || $previous['data'][ $key ] !== $current['data'][ $key ] ) {
+				$changed[] = $key;
 			}
 		}
 
 		foreach ( array_unique( array_merge( array_keys( $previous['meta'] ), array_keys( $current['meta'] ) ) ) as $key ) {
 			$before = isset( $previous['meta'][ $key ] ) ? $previous['meta'][ $key ] : null;
 			$after  = isset( $current['meta'][ $key ] ) ? $current['meta'][ $key ] : null;
-			if ( $before === $after ) {
-				continue;
+			if ( $before !== $after ) {
+				$changed[] = 'meta.' . $key;
 			}
-			// WooCommerce writes its own version on every product save.
-			if ( '_product_version' === $key && array( (string) WC_VERSION ) === $after ) {
-				continue;
-			}
-			// The block editor refreshes its lock while someone has the product open; it is not product data.
-			if ( '_edit_lock' === $key ) {
-				continue;
-			}
-			$changed[] = 'meta.' . $key;
-		}
-
-		if ( $previous['terms'] !== $current['terms'] ) {
-			$changed[] = 'terms';
 		}
 
 		return $changed;
@@ -1094,7 +1070,7 @@ final class Safe_AI_Change {
 	 */
 	private function run_checks( $product_id, $phase, $snapshot = null, $expected_text = null ) {
 		$checks   = array();
-		$restored = null !== $snapshot && (string) $snapshot['post']['post_excerpt'] === $expected_text;
+		$restored = null !== $snapshot && (string) $snapshot['data']['short_description'] === $expected_text;
 
 		if ( null !== $snapshot ) {
 			$checks[] = $this->check_database( $product_id, $snapshot, $expected_text, $phase, $restored );
@@ -1113,7 +1089,7 @@ final class Safe_AI_Change {
 		} else {
 			$label = __( 'Product page shows the new text', 'safe-ai-change' );
 		}
-		$checks[] = $this->check_page( $phase, $label, get_permalink( $product_id ), $expected_text );
+		$checks[] = $this->check_page( $phase, $label, $product->get_permalink(), $expected_text );
 		$checks[] = $this->check_page( $phase, __( 'Home page', 'safe-ai-change' ), home_url( '/' ) );
 		$checks[] = $this->check_page( $phase, __( 'Shop page', 'safe-ai-change' ), wc_get_page_permalink( 'shop' ) );
 		$checks[] = $this->check_page( $phase, __( 'Cart page', 'safe-ai-change' ), wc_get_cart_url() );
@@ -1134,15 +1110,15 @@ final class Safe_AI_Change {
 	private function check_database( $product_id, array $snapshot, $expected_text, $phase, $restored ) {
 		$now     = $this->take_snapshot( $product_id );
 		$diff    = $this->snapshot_diff( $snapshot, $now );
-		$wanted  = $restored ? array() : array( 'posts.post_excerpt' );
-		$text_ok = isset( $now['post']['post_excerpt'] ) && (string) $now['post']['post_excerpt'] === $expected_text;
+		$wanted  = $restored ? array() : array( 'short_description' );
+		$text_ok = isset( $now['data']['short_description'] ) && (string) $now['data']['short_description'] === $expected_text;
 		$pass    = $text_ok && $wanted === $diff;
 		$name    = $restored ? __( 'Database: product matches the snapshot', 'safe-ai-change' ) : __( 'Database: only the short description changed', 'safe-ai-change' );
 
 		if ( $pass ) {
-			$detail = $restored ? __( 'Every field matches the snapshot.', 'safe-ai-change' ) : __( 'Only post_excerpt differs from the snapshot.', 'safe-ai-change' );
+			$detail = $restored ? __( 'Every product property and meta value matches the snapshot.', 'safe-ai-change' ) : __( 'Only short_description differs from the snapshot.', 'safe-ai-change' );
 		} else {
-			$detail = $text_ok ? '' : __( 'post_excerpt does not hold the expected text.', 'safe-ai-change' ) . ' ';
+			$detail = $text_ok ? '' : __( 'The short description does not hold the expected text.', 'safe-ai-change' ) . ' ';
 			/* translators: %s: list of changed database fields. */
 			$detail .= $diff ? sprintf( __( 'Changed fields: %s', 'safe-ai-change' ), implode( ', ', $diff ) ) : __( 'No field changed.', 'safe-ai-change' );
 		}
